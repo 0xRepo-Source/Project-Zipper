@@ -1,0 +1,17 @@
+# Build artifacts
+/bin/
+*.exe
+*.test
+*.out
+
+# Dependency directories
+/vendor/
+
+# IDE/editor settings
+.idea/
+.vscode/
+*.swp
+
+# OS-specific files
+.DS_Store
+Thumbs.db
