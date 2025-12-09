@@ -5,6 +5,8 @@ import (
 	"archive/zip"
 	"compress/flate"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -22,6 +24,7 @@ type ProgressFunc func(done, total int64)
 type ArchiveStats struct {
 	TotalBytes int64
 	FileCount  int
+	Checksum   string // SHA-256 checksum of the archive
 }
 
 // getWorkerCount returns the number of workers to use (50% of CPU cores, minimum 1)
@@ -92,11 +95,6 @@ func ZipWithProgress(srcDir, zipPath string, progress ProgressFunc) (stats Archi
 	if err != nil {
 		return stats, err
 	}
-	defer func() {
-		if cerr := zipFile.Close(); err == nil {
-			err = cerr
-		}
-	}()
 
 	writer := zip.NewWriter(zipFile)
 	// Register custom compressor with optimal level based on total size
@@ -104,11 +102,6 @@ func ZipWithProgress(srcDir, zipPath string, progress ProgressFunc) (stats Archi
 	writer.RegisterCompressor(zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
 		return flate.NewWriter(out, compressionLevel)
 	})
-	defer func() {
-		if cerr := writer.Close(); err == nil {
-			err = cerr
-		}
-	}()
 
 	done := int64(0)
 	var doneMutex sync.Mutex
@@ -244,7 +237,27 @@ func ZipWithProgress(srcDir, zipPath string, progress ProgressFunc) (stats Archi
 	}
 
 	callProgress()
-	return stats, err
+
+	// Close writer and file explicitly before calculating checksum
+	if err := writer.Close(); err != nil {
+		return stats, err
+	}
+	if err := zipFile.Close(); err != nil {
+		return stats, err
+	}
+
+	// Calculate checksum of the created archive
+	stats.Checksum, err = calculateFileChecksum(zipPath)
+	if err != nil {
+		return stats, fmt.Errorf("checksum calculation failed: %w", err)
+	}
+
+	// Store checksum in zip comment
+	if err := addChecksumToZip(zipPath, stats.Checksum); err != nil {
+		return stats, fmt.Errorf("failed to add checksum: %w", err)
+	}
+
+	return stats, nil
 }
 
 type progressWriter struct {
@@ -501,11 +514,6 @@ func GzipWithProgress(srcDir, gzipPath string, progress ProgressFunc) (stats Arc
 	if err != nil {
 		return stats, err
 	}
-	defer func() {
-		if cerr := gzipFile.Close(); err == nil {
-			err = cerr
-		}
-	}()
 
 	// Use optimal compression level based on total size
 	compressionLevel := getOptimalCompressionLevel(stats.TotalBytes)
@@ -513,18 +521,8 @@ func GzipWithProgress(srcDir, gzipPath string, progress ProgressFunc) (stats Arc
 	if err != nil {
 		return stats, err
 	}
-	defer func() {
-		if cerr := gzWriter.Close(); err == nil {
-			err = cerr
-		}
-	}()
 
 	tarWriter := tar.NewWriter(gzWriter)
-	defer func() {
-		if cerr := tarWriter.Close(); err == nil {
-			err = cerr
-		}
-	}()
 
 	done := int64(0)
 	var doneMutex sync.Mutex
@@ -651,7 +649,30 @@ func GzipWithProgress(srcDir, gzipPath string, progress ProgressFunc) (stats Arc
 	}
 
 	callProgress()
-	return stats, err
+
+	// Close writers explicitly before calculating checksum
+	if err := tarWriter.Close(); err != nil {
+		return stats, err
+	}
+	if err := gzWriter.Close(); err != nil {
+		return stats, err
+	}
+	if err := gzipFile.Close(); err != nil {
+		return stats, err
+	}
+
+	// Calculate checksum of the created archive
+	stats.Checksum, err = calculateFileChecksum(gzipPath)
+	if err != nil {
+		return stats, fmt.Errorf("checksum calculation failed: %w", err)
+	}
+
+	// Store checksum in a separate .sha256 file
+	if err := writeChecksumFile(gzipPath, stats.Checksum); err != nil {
+		return stats, fmt.Errorf("failed to write checksum file: %w", err)
+	}
+
+	return stats, nil
 }
 
 // ExtractGzip extracts a tar.gz archive to the destination directory
@@ -764,4 +785,142 @@ func ExtractGzipWithProgress(gzipPath, destDir string, progress ProgressFunc) (s
 
 	callProgress()
 	return stats, nil
+}
+
+// calculateFileChecksum computes SHA-256 checksum of a file
+func calculateFileChecksum(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// addChecksumToZip adds the checksum to the zip file comment
+func addChecksumToZip(zipPath, checksum string) error {
+	// Read the zip file
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+
+	// Create a temporary file
+	tempPath := zipPath + ".tmp"
+	tempFile, err := os.Create(tempPath)
+	if err != nil {
+		r.Close()
+		return err
+	}
+
+	// Create new zip writer
+	w := zip.NewWriter(tempFile)
+	w.SetComment(fmt.Sprintf("SHA256: %s", checksum))
+
+	// Copy all files from original zip
+	for _, f := range r.File {
+		if err := copyZipFile(w, f); err != nil {
+			w.Close()
+			tempFile.Close()
+			r.Close()
+			os.Remove(tempPath)
+			return err
+		}
+	}
+
+	r.Close()
+	if err := w.Close(); err != nil {
+		tempFile.Close()
+		os.Remove(tempPath)
+		return err
+	}
+	if err := tempFile.Close(); err != nil {
+		os.Remove(tempPath)
+		return err
+	}
+
+	// Replace original with temp
+	if err := os.Remove(zipPath); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, zipPath)
+}
+
+// copyZipFile copies a file from one zip to another
+func copyZipFile(w *zip.Writer, f *zip.File) error {
+	fw, err := w.CreateHeader(&f.FileHeader)
+	if err != nil {
+		return err
+	}
+
+	fr, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer fr.Close()
+
+	_, err = io.Copy(fw, fr)
+	return err
+}
+
+// writeChecksumFile writes checksum to a .sha256 file
+func writeChecksumFile(archivePath, checksum string) error {
+	checksumPath := archivePath + ".sha256"
+	content := fmt.Sprintf("%s *%s\n", checksum, filepath.Base(archivePath))
+	return os.WriteFile(checksumPath, []byte(content), 0644)
+}
+
+// VerifyChecksum verifies the checksum of an archive
+func VerifyChecksum(archivePath string) (bool, string, error) {
+	ext := strings.ToLower(filepath.Ext(archivePath))
+
+	if ext == ".zip" {
+		// Read checksum from zip comment
+		r, err := zip.OpenReader(archivePath)
+		if err != nil {
+			return false, "", err
+		}
+		defer r.Close()
+
+		comment := r.Comment
+		if !strings.HasPrefix(comment, "SHA256: ") {
+			return false, "", fmt.Errorf("no checksum found in archive")
+		}
+
+		storedChecksum := strings.TrimPrefix(comment, "SHA256: ")
+		actualChecksum, err := calculateFileChecksum(archivePath)
+		if err != nil {
+			return false, "", err
+		}
+
+		return storedChecksum == actualChecksum, storedChecksum, nil
+	} else if ext == ".gz" || strings.HasSuffix(archivePath, ".tar.gz") {
+		// Read from .sha256 file
+		checksumPath := archivePath + ".sha256"
+		data, err := os.ReadFile(checksumPath)
+		if err != nil {
+			return false, "", fmt.Errorf("checksum file not found: %w", err)
+		}
+
+		parts := strings.Fields(string(data))
+		if len(parts) < 1 {
+			return false, "", fmt.Errorf("invalid checksum file format")
+		}
+
+		storedChecksum := parts[0]
+		actualChecksum, err := calculateFileChecksum(archivePath)
+		if err != nil {
+			return false, "", err
+		}
+
+		return storedChecksum == actualChecksum, storedChecksum, nil
+	}
+
+	return false, "", fmt.Errorf("unsupported archive format")
 }

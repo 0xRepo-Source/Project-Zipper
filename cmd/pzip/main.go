@@ -266,6 +266,9 @@ func (p *createProgressPrinter) Complete(zipPath string, stats zipper.ArchiveSta
 		formatBytes(zipSize),
 		stats.FileCount,
 	)
+	if stats.Checksum != "" {
+		fmt.Fprintf(os.Stdout, "  SHA-256: %s\n", stats.Checksum)
+	}
 }
 
 // Extract mode progress printer

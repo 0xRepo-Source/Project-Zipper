@@ -10,6 +10,10 @@
   - Large archives (100-500MB): Speed-favored compression
   - Very large archives (>500MB): Maximum speed
   - Already-compressed files (JPG, PNG, MP4, ZIP, etc.): Stored without recompression for efficiency
+- **Automatic Checksum** - SHA-256 hash calculated and stored for every archive
+  - ZIP archives: Checksum stored in archive comment
+  - tar.gz archives: Checksum stored in `.sha256` sidecar file
+  - Displayed after compression completes
 - **Multi-threaded compression/extraction** - Automatically uses 50% of available CPU cores for parallel processing
 - **Multiple formats** - Supports both ZIP and tar.gz formats
 - **Smart naming** - Auto-versioning (e.g., `project.zip`, `project-v1.zip`, `project-v2.zip`)
