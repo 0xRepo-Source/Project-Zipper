@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -176,7 +177,12 @@ func (p *createProgressPrinter) OnProgress(done, total int64) {
 		p.started = true
 		p.startTime = time.Now()
 		p.total = total
-		fmt.Fprintf(os.Stdout, "Creating archive for %s (%s)...\n", p.source, formatBytes(total))
+		numCPU := runtime.NumCPU()
+		workers := numCPU / 2
+		if workers < 1 {
+			workers = 1
+		}
+		fmt.Fprintf(os.Stdout, "Creating archive for %s (%s) using %d/%d CPUs...\n", p.source, formatBytes(total), workers, numCPU)
 	}
 
 	line := p.renderLine(done, total)
@@ -271,7 +277,12 @@ func (p *extractProgressPrinter) OnProgress(done, total int64) {
 		p.started = true
 		p.startTime = time.Now()
 		p.total = total
-		fmt.Fprintf(os.Stdout, "Extracting %s (%s)...\n", filepath.Base(p.zipPath), formatBytes(total))
+		numCPU := runtime.NumCPU()
+		workers := numCPU / 2
+		if workers < 1 {
+			workers = 1
+		}
+		fmt.Fprintf(os.Stdout, "Extracting %s (%s) using %d/%d CPUs...\n", filepath.Base(p.zipPath), formatBytes(total), workers, numCPU)
 	}
 
 	line := p.renderLine(done, total)

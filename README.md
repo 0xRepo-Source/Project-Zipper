@@ -1,6 +1,15 @@
 # Project Zipper
 
-`pz` is a lightweight Go CLI that creates and extracts zip and gzip archives using only the Go standard library. It generates unique archive names by appending version suffixes when an archive with the base name already exists.
+`pz` is a lightweight Go CLI that creates and extracts zip and gzip archives using only the Go standard library. It features automatic multi-threading (using 50% of available CPU cores) for improved performance and generates unique archive names by appending version suffixes when an archive with the base name already exists.
+
+## Features
+
+- **Multi-threaded compression/extraction** - Automatically uses 50% of available CPU cores for parallel processing
+- **Multiple formats** - Supports both ZIP and tar.gz formats
+- **Smart naming** - Auto-versioning (e.g., `project.zip`, `project-v1.zip`, `project-v2.zip`)
+- **Progress tracking** - Real-time progress bars with speed indicators
+- **Cross-platform** - Works on Windows, Linux, and macOS
+- **Security** - Built-in path traversal protection
 
 ## Prerequisites
 
@@ -55,17 +64,19 @@ pz -x <archive.tar.gz> <destination-folder>
 
 **Creating Archive:**
 ```text
-Creating archive for H:\Example\Project (6.1 MB)...
+Creating archive for H:\Example\Project (6.1 MB) using 18/36 CPUs...
 [##############################--------------------] 62% (3.8 MB/6.1 MB) 4.2 MB/s
-Archive complete: H:\Example\Project -> H:\Example\Project.zip (6.1 MB source, 2.9 MB archive, 12 files)
+✓ Archive complete: H:\Example\Project -> H:\Example\Project.zip (6.1 MB source, 2.9 MB archive, 12 files)
 ```
 
 **Extracting Archive:**
 ```text
-Extracting Project.zip (2.9 MB)...
+Extracting Project.zip (2.9 MB) using 18/36 CPUs...
 [##################################################] 100% (6.1 MB/6.1 MB) 8.3 MB/s
-Extraction complete: Project.zip -> H:\Example\Extracted (6.1 MB extracted, 12 files)
+✓ Extraction complete: Project.zip -> H:\Example\Extracted (6.1 MB extracted, 12 files)
 ```
+
+The tool automatically detects your CPU count and uses 50% of available cores for parallel file processing, significantly improving performance on multi-core systems.
 
 ## Windows Env
 

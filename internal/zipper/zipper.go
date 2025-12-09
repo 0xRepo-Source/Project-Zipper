@@ -9,6 +9,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 )
 
 // ProgressFunc reports the number of source bytes processed out of the total.
@@ -18,6 +20,24 @@ type ProgressFunc func(done, total int64)
 type ArchiveStats struct {
 	TotalBytes int64
 	FileCount  int
+}
+
+// getWorkerCount returns the number of workers to use (50% of CPU cores, minimum 1)
+func getWorkerCount() int {
+	numCPU := runtime.NumCPU()
+	workers := numCPU / 2
+	if workers < 1 {
+		workers = 1
+	}
+	return workers
+}
+
+// fileJob represents a file to be compressed
+type fileJob struct {
+	path  string
+	rel   string
+	info  fs.FileInfo
+	isDir bool
 }
 
 // Zip archives the contents of srcDir into zipPath using only the Go standard library.
@@ -51,13 +71,18 @@ func ZipWithProgress(srcDir, zipPath string, progress ProgressFunc) (stats Archi
 	}()
 
 	done := int64(0)
+	var doneMutex sync.Mutex
 	callProgress := func() {
 		if progress != nil {
+			doneMutex.Lock()
 			progress(done, stats.TotalBytes)
+			doneMutex.Unlock()
 		}
 	}
 	callProgress()
 
+	// Collect all files first
+	var files []fileJob
 	err = filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -77,13 +102,79 @@ func ZipWithProgress(srcDir, zipPath string, progress ProgressFunc) (stats Archi
 			return err
 		}
 
-		header, err := zip.FileInfoHeader(info)
-		if err != nil {
-			return err
+		files = append(files, fileJob{
+			path:  path,
+			rel:   rel,
+			info:  info,
+			isDir: d.IsDir(),
+		})
+		return nil
+	})
+	if err != nil {
+		return stats, err
+	}
+
+	// Process files with worker pool for reading
+	workerCount := getWorkerCount()
+	type fileData struct {
+		job  fileJob
+		data []byte
+		err  error
+	}
+
+	dataChan := make(chan fileData, workerCount)
+	var wg sync.WaitGroup
+
+	// Start workers to read files in parallel
+	jobChan := make(chan fileJob, len(files))
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobChan {
+				if job.isDir {
+					dataChan <- fileData{job: job}
+					continue
+				}
+
+				data, err := os.ReadFile(job.path)
+				dataChan <- fileData{
+					job:  job,
+					data: data,
+					err:  err,
+				}
+			}
+		}()
+	}
+
+	// Send jobs to workers
+	go func() {
+		for _, file := range files {
+			jobChan <- file
+		}
+		close(jobChan)
+	}()
+
+	// Close data channel when all workers finish
+	go func() {
+		wg.Wait()
+		close(dataChan)
+	}()
+
+	// Write to zip sequentially (required by zip format)
+	processedCount := 0
+	for fd := range dataChan {
+		if fd.err != nil {
+			return stats, fd.err
 		}
 
-		header.Name = filepath.ToSlash(rel)
-		if d.IsDir() {
+		header, err := zip.FileInfoHeader(fd.job.info)
+		if err != nil {
+			return stats, err
+		}
+
+		header.Name = filepath.ToSlash(fd.job.rel)
+		if fd.job.isDir {
 			header.Name += "/"
 		} else {
 			header.Method = zip.Deflate
@@ -91,37 +182,25 @@ func ZipWithProgress(srcDir, zipPath string, progress ProgressFunc) (stats Archi
 
 		writerEntry, err := writer.CreateHeader(header)
 		if err != nil {
-			return err
+			return stats, err
 		}
 
-		if d.IsDir() {
-			return nil
+		if !fd.job.isDir {
+			_, err = writerEntry.Write(fd.data)
+			if err != nil {
+				return stats, err
+			}
+
+			doneMutex.Lock()
+			done += int64(len(fd.data))
+			doneMutex.Unlock()
+
+			if progress != nil {
+				callProgress()
+			}
 		}
 
-		file, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-
-		pw := progressWriter{
-			w:        writerEntry,
-			done:     &done,
-			total:    stats.TotalBytes,
-			progress: progress,
-		}
-
-		if _, err = io.Copy(&pw, file); err != nil {
-			file.Close()
-			return err
-		}
-		if closeErr := file.Close(); closeErr != nil {
-			return closeErr
-		}
-
-		return nil
-	})
-	if err != nil {
-		return stats, err
+		processedCount++
 	}
 
 	callProgress()
@@ -198,37 +277,127 @@ func ExtractWithProgress(zipPath, destDir string, progress ProgressFunc) (stats 
 	stats.FileCount = fileCount
 
 	done := int64(0)
+	var doneMutex sync.Mutex
 	callProgress := func() {
 		if progress != nil {
+			doneMutex.Lock()
 			progress(done, totalBytes)
+			doneMutex.Unlock()
 		}
 	}
 	callProgress()
 
+	// Create directories first
 	for _, f := range reader.File {
-		destPath := filepath.Join(destDir, filepath.FromSlash(f.Name))
-
-		// Security check: prevent path traversal
-		if !filepath.IsLocal(f.Name) {
-			return stats, fmt.Errorf("invalid file path: %s", f.Name)
-		}
-
 		if f.FileInfo().IsDir() {
+			destPath := filepath.Join(destDir, filepath.FromSlash(f.Name))
+			if !filepath.IsLocal(f.Name) {
+				return stats, fmt.Errorf("invalid file path: %s", f.Name)
+			}
 			if err := os.MkdirAll(destPath, f.Mode()); err != nil {
 				return stats, err
 			}
-			continue
 		}
+	}
 
-		// Ensure parent directory exists
-		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-			return stats, err
-		}
+	// Extract files in parallel
+	workerCount := getWorkerCount()
+	type extractJob struct {
+		file     *zip.File
+		destPath string
+	}
 
-		// Extract file
-		if err := extractFile(f, destPath, &done, totalBytes, progress); err != nil {
-			return stats, err
+	jobChan := make(chan extractJob, len(reader.File))
+	errChan := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobChan {
+				rc, err := job.file.Open()
+				if err != nil {
+					select {
+					case errChan <- err:
+					default:
+					}
+					return
+				}
+
+				outFile, err := os.OpenFile(job.destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, job.file.Mode())
+				if err != nil {
+					rc.Close()
+					select {
+					case errChan <- err:
+					default:
+					}
+					return
+				}
+
+				written, err := io.Copy(outFile, rc)
+				rc.Close()
+				outFile.Close()
+
+				if err != nil {
+					select {
+					case errChan <- err:
+					default:
+					}
+					return
+				}
+
+				doneMutex.Lock()
+				done += written
+				doneMutex.Unlock()
+
+				if progress != nil {
+					callProgress()
+				}
+			}
+		}()
+	}
+
+	// Send jobs
+	go func() {
+		for _, f := range reader.File {
+			if f.FileInfo().IsDir() {
+				continue
+			}
+
+			destPath := filepath.Join(destDir, filepath.FromSlash(f.Name))
+
+			// Security check: prevent path traversal
+			if !filepath.IsLocal(f.Name) {
+				select {
+				case errChan <- fmt.Errorf("invalid file path: %s", f.Name):
+				default:
+				}
+				break
+			}
+
+			// Ensure parent directory exists
+			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				select {
+				case errChan <- err:
+				default:
+				}
+				break
+			}
+
+			jobChan <- extractJob{file: f, destPath: destPath}
 		}
+		close(jobChan)
+	}()
+
+	// Wait for completion
+	wg.Wait()
+	close(errChan)
+
+	// Check for errors
+	if err := <-errChan; err != nil {
+		return stats, err
 	}
 
 	callProgress()
@@ -298,7 +467,10 @@ func GzipWithProgress(srcDir, gzipPath string, progress ProgressFunc) (stats Arc
 		}
 	}()
 
-	gzWriter := gzip.NewWriter(gzipFile)
+	gzWriter, err := gzip.NewWriterLevel(gzipFile, gzip.BestSpeed)
+	if err != nil {
+		return stats, err
+	}
 	defer func() {
 		if cerr := gzWriter.Close(); err == nil {
 			err = cerr
@@ -313,13 +485,18 @@ func GzipWithProgress(srcDir, gzipPath string, progress ProgressFunc) (stats Arc
 	}()
 
 	done := int64(0)
+	var doneMutex sync.Mutex
 	callProgress := func() {
 		if progress != nil {
+			doneMutex.Lock()
 			progress(done, stats.TotalBytes)
+			doneMutex.Unlock()
 		}
 	}
 	callProgress()
 
+	// Collect all files first
+	var files []fileJob
 	err = filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -339,45 +516,96 @@ func GzipWithProgress(srcDir, gzipPath string, progress ProgressFunc) (stats Arc
 			return err
 		}
 
-		header, err := tar.FileInfoHeader(info, "")
-		if err != nil {
-			return err
-		}
-
-		header.Name = filepath.ToSlash(rel)
-
-		if err := tarWriter.WriteHeader(header); err != nil {
-			return err
-		}
-
-		if d.IsDir() {
-			return nil
-		}
-
-		file, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-
-		pw := progressWriter{
-			w:        tarWriter,
-			done:     &done,
-			total:    stats.TotalBytes,
-			progress: progress,
-		}
-
-		if _, err = io.Copy(&pw, file); err != nil {
-			file.Close()
-			return err
-		}
-		if closeErr := file.Close(); closeErr != nil {
-			return closeErr
-		}
-
+		files = append(files, fileJob{
+			path:  path,
+			rel:   rel,
+			info:  info,
+			isDir: d.IsDir(),
+		})
 		return nil
 	})
 	if err != nil {
 		return stats, err
+	}
+
+	// Process files with worker pool for reading
+	workerCount := getWorkerCount()
+	type fileData struct {
+		job  fileJob
+		data []byte
+		err  error
+	}
+
+	dataChan := make(chan fileData, workerCount)
+	var wg sync.WaitGroup
+
+	// Start workers to read files in parallel
+	jobChan := make(chan fileJob, len(files))
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobChan {
+				if job.isDir {
+					dataChan <- fileData{job: job}
+					continue
+				}
+
+				data, err := os.ReadFile(job.path)
+				dataChan <- fileData{
+					job:  job,
+					data: data,
+					err:  err,
+				}
+			}
+		}()
+	}
+
+	// Send jobs to workers
+	go func() {
+		for _, file := range files {
+			jobChan <- file
+		}
+		close(jobChan)
+	}()
+
+	// Close data channel when all workers finish
+	go func() {
+		wg.Wait()
+		close(dataChan)
+	}()
+
+	// Write to tar sequentially (required by tar format)
+	for fd := range dataChan {
+		if fd.err != nil {
+			return stats, fd.err
+		}
+
+		header, err := tar.FileInfoHeader(fd.job.info, "")
+		if err != nil {
+			return stats, err
+		}
+
+		header.Name = filepath.ToSlash(fd.job.rel)
+
+		if err := tarWriter.WriteHeader(header); err != nil {
+			return stats, err
+		}
+
+		if !fd.job.isDir {
+			_, err = tarWriter.Write(fd.data)
+			if err != nil {
+				return stats, err
+			}
+
+			doneMutex.Lock()
+			done += int64(len(fd.data))
+			doneMutex.Unlock()
+
+			if progress != nil {
+				callProgress()
+			}
+		}
 	}
 
 	callProgress()
