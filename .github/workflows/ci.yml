@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
@@ -19,12 +19,12 @@ jobs:
 
       - name: Verify formatting
         run: |
-          fmt_output=$(gofmt -l .)
-          if [ -n "$fmt_output" ]; then
-            echo "The following files need gofmt:" >&2
-            echo "$fmt_output" >&2
+          $fmt_output = gofmt -l .
+          if ($fmt_output) {
+            Write-Error "The following files need gofmt:"
+            Write-Error $fmt_output
             exit 1
-          fi
+          }
 
       - name: Run tests
         run: go test ./...
