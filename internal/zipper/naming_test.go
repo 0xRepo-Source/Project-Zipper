@@ -41,3 +41,39 @@ func TestNextArchiveName(t *testing.T) {
 		t.Fatalf("expected project-v2.zip, got %s", filepath.Base(path2))
 	}
 }
+
+func TestNextGzipArchiveName(t *testing.T) {
+	tmp := t.TempDir()
+
+	path0, err := NextGzipArchiveName(tmp, "project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if filepath.Base(path0) != "project.tar.gz" {
+		t.Fatalf("expected project.tar.gz, got %s", filepath.Base(path0))
+	}
+
+	if err := os.WriteFile(path0, []byte("test"), 0o600); err != nil {
+		t.Fatalf("failed to create tar.gz placeholder: %v", err)
+	}
+
+	path1, err := NextGzipArchiveName(tmp, "project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if filepath.Base(path1) != "project-v1.tar.gz" {
+		t.Fatalf("expected project-v1.tar.gz, got %s", filepath.Base(path1))
+	}
+
+	if err := os.WriteFile(path1, []byte("test"), 0o600); err != nil {
+		t.Fatalf("failed to create versioned tar.gz placeholder: %v", err)
+	}
+
+	path2, err := NextGzipArchiveName(tmp, "project")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if filepath.Base(path2) != "project-v2.tar.gz" {
+		t.Fatalf("expected project-v2.tar.gz, got %s", filepath.Base(path2))
+	}
+}

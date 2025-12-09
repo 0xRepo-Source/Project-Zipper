@@ -13,15 +13,17 @@ import (
 )
 
 func main() {
-	extractFlag := flag.Bool("x", false, "extract mode: extract zip archive to destination")
+	extractFlag := flag.Bool("x", false, "extract mode: extract archive to destination")
+	formatFlag := flag.String("f", "zip", "archive format: zip or gz (tar.gz)")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options] <source> [destination]\n", filepath.Base(os.Args[0]))
-		fmt.Fprintln(flag.CommandLine.Output(), "\nCreate or extract zip archives.")
+		fmt.Fprintln(flag.CommandLine.Output(), "\nCreate or extract archives.")
 		fmt.Fprintln(flag.CommandLine.Output(), "CREATE MODE (default):")
 		fmt.Fprintln(flag.CommandLine.Output(), "  pz <folder>           Create a zip archive of the folder")
+		fmt.Fprintln(flag.CommandLine.Output(), "  pz -f gz <folder>     Create a tar.gz archive of the folder")
 		fmt.Fprintln(flag.CommandLine.Output(), "\nEXTRACT MODE:")
 		fmt.Fprintln(flag.CommandLine.Output(), "  pz -x <archive.zip>   Extract archive to current directory")
-		fmt.Fprintln(flag.CommandLine.Output(), "  pz -x <archive.zip> <dest>  Extract archive to destination folder")
+		fmt.Fprintln(flag.CommandLine.Output(), "  pz -x <archive.tar.gz> <dest>  Extract archive to destination folder")
 	}
 
 	flag.Parse()
@@ -34,11 +36,11 @@ func main() {
 	if *extractFlag {
 		doExtract(flag.Args())
 	} else {
-		doCreate(flag.Args())
+		doCreate(flag.Args(), *formatFlag)
 	}
 }
 
-func doCreate(args []string) {
+func doCreate(args []string, format string) {
 	target := strings.Join(args, " ")
 	absTarget, err := filepath.Abs(target)
 	if err != nil {
@@ -56,43 +58,60 @@ func doCreate(args []string) {
 	parent := filepath.Dir(absTarget)
 	base := filepath.Base(absTarget)
 
-	zipPath, err := zipper.NextArchiveName(parent, base)
-	if err != nil {
-		exitWithError(err)
-	}
+	var archivePath string
+	var stats zipper.ArchiveStats
 
 	printer := newCreateProgressPrinter(absTarget)
-	stats, err := zipper.ZipWithProgress(absTarget, zipPath, printer.OnProgress)
-	if err != nil {
-		exitWithError(err)
-	}
-	printer.Complete(zipPath, stats)
 
-	fmt.Println(zipPath)
+	switch strings.ToLower(format) {
+	case "gz", "gzip", "tar.gz":
+		archivePath, err = zipper.NextGzipArchiveName(parent, base)
+		if err != nil {
+			exitWithError(err)
+		}
+		stats, err = zipper.GzipWithProgress(absTarget, archivePath, printer.OnProgress)
+		if err != nil {
+			exitWithError(err)
+		}
+	case "zip":
+		archivePath, err = zipper.NextArchiveName(parent, base)
+		if err != nil {
+			exitWithError(err)
+		}
+		stats, err = zipper.ZipWithProgress(absTarget, archivePath, printer.OnProgress)
+		if err != nil {
+			exitWithError(err)
+		}
+	default:
+		exitWithError(fmt.Errorf("unsupported format: %s (use 'zip' or 'gz')", format))
+	}
+
+	printer.Complete(archivePath, stats)
+	fmt.Println(archivePath)
 }
 
 func doExtract(args []string) {
 	if len(args) < 1 {
-		exitWithError(errors.New("extract mode requires a zip file"))
+		exitWithError(errors.New("extract mode requires an archive file"))
 	}
 
-	zipPath := strings.Join(args, " ")
+	archivePath := strings.Join(args, " ")
 	if len(args) > 1 {
-		// If multiple args, first is zip, rest is destination
-		zipPath = args[0]
+		// If multiple args, first is archive, rest is destination
+		archivePath = args[0]
 	}
 
-	absZipPath, err := filepath.Abs(zipPath)
+	absArchivePath, err := filepath.Abs(archivePath)
 	if err != nil {
 		exitWithError(err)
 	}
 
-	info, err := os.Stat(absZipPath)
+	info, err := os.Stat(absArchivePath)
 	if err != nil {
 		exitWithError(err)
 	}
 	if info.IsDir() {
-		exitWithError(errors.New("source must be a zip file, not a directory"))
+		exitWithError(errors.New("source must be an archive file, not a directory"))
 	}
 
 	// Determine destination
@@ -112,8 +131,20 @@ func doExtract(args []string) {
 		exitWithError(err)
 	}
 
-	printer := newExtractProgressPrinter(absZipPath, absDestDir)
-	stats, err := zipper.ExtractWithProgress(absZipPath, absDestDir, printer.OnProgress)
+	printer := newExtractProgressPrinter(absArchivePath, absDestDir)
+
+	// Auto-detect format based on file extension
+	var stats zipper.ExtractStats
+	if strings.HasSuffix(strings.ToLower(absArchivePath), ".tar.gz") || strings.HasSuffix(strings.ToLower(absArchivePath), ".tgz") {
+		stats, err = zipper.ExtractGzipWithProgress(absArchivePath, absDestDir, printer.OnProgress)
+	} else if strings.HasSuffix(strings.ToLower(absArchivePath), ".gz") {
+		// Check if it's a tar.gz by trying to open as such
+		stats, err = zipper.ExtractGzipWithProgress(absArchivePath, absDestDir, printer.OnProgress)
+	} else {
+		// Default to zip
+		stats, err = zipper.ExtractWithProgress(absArchivePath, absDestDir, printer.OnProgress)
+	}
+
 	if err != nil {
 		exitWithError(err)
 	}

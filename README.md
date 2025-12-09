@@ -1,6 +1,6 @@
 # Project Zipper
 
-`pz` is a lightweight Go CLI that creates and extracts zip archives using only the Go standard library. It generates unique archive names by appending version suffixes when a zip with the base name already exists.
+`pz` is a lightweight Go CLI that creates and extracts zip and gzip archives using only the Go standard library. It generates unique archive names by appending version suffixes when an archive with the base name already exists.
 
 ## Prerequisites
 
@@ -19,12 +19,18 @@ This installs the `pzip` binary into your `$GOBIN` (or `$GOPATH/bin`).
 
 ### Create Archive
 
+**Create ZIP archive (default):**
 ```powershell
 pz <path-to-folder>
 ```
 
-- Archives the specified folder into `<folder>.zip` alongside the source folder.
-- If `<folder>.zip` already exists, a versioned archive such as `<folder>-v1.zip`, `<folder>-v2.zip`, etc. is created instead.
+**Create tar.gz archive:**
+```powershell
+pz -f gz <path-to-folder>
+```
+
+- Archives the specified folder into `<folder>.zip` or `<folder>.tar.gz` alongside the source folder.
+- If `<folder>.zip` (or `.tar.gz`) already exists, a versioned archive such as `<folder>-v1.zip`, `<folder>-v2.zip`, etc. is created instead.
 - Paths containing spaces are supported without quoting (e.g. `pz C:\Active Projects`).
 
 ### Extract Archive
@@ -32,12 +38,15 @@ pz <path-to-folder>
 ```powershell
 # Extract to current directory
 pz -x <archive.zip>
+pz -x <archive.tar.gz>
 
 # Extract to specific destination
 pz -x <archive.zip> <destination-folder>
+pz -x <archive.tar.gz> <destination-folder>
 ```
 
-- Extracts the contents of a zip archive
+- Extracts the contents of a zip or tar.gz archive
+- Automatically detects archive format based on file extension
 - Creates destination directory if it doesn't exist
 - Shows progress bar with extraction speed
 - Includes path traversal protection for security

@@ -1,7 +1,9 @@
 package zipper
 
 import (
+	"archive/tar"
 	"archive/zip"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"io/fs"
@@ -271,4 +273,225 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 		pr.progress(*pr.done, pr.total)
 	}
 	return n, err
+}
+
+// Gzip creates a tar.gz archive of the source directory
+func Gzip(srcDir, gzipPath string) error {
+	_, err := GzipWithProgress(srcDir, gzipPath, nil)
+	return err
+}
+
+// GzipWithProgress creates a tar.gz archive and reports progress via callback
+func GzipWithProgress(srcDir, gzipPath string, progress ProgressFunc) (stats ArchiveStats, err error) {
+	stats, err = scanDirectory(srcDir)
+	if err != nil {
+		return stats, err
+	}
+
+	gzipFile, err := os.Create(gzipPath)
+	if err != nil {
+		return stats, err
+	}
+	defer func() {
+		if cerr := gzipFile.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
+	gzWriter := gzip.NewWriter(gzipFile)
+	defer func() {
+		if cerr := gzWriter.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
+	tarWriter := tar.NewWriter(gzWriter)
+	defer func() {
+		if cerr := tarWriter.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
+	done := int64(0)
+	callProgress := func() {
+		if progress != nil {
+			progress(done, stats.TotalBytes)
+		}
+	}
+	callProgress()
+
+	err = filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+
+		rel, err := filepath.Rel(srcDir, path)
+		if err != nil {
+			return err
+		}
+
+		if rel == "." {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+
+		header, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+
+		header.Name = filepath.ToSlash(rel)
+
+		if err := tarWriter.WriteHeader(header); err != nil {
+			return err
+		}
+
+		if d.IsDir() {
+			return nil
+		}
+
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+
+		pw := progressWriter{
+			w:        tarWriter,
+			done:     &done,
+			total:    stats.TotalBytes,
+			progress: progress,
+		}
+
+		if _, err = io.Copy(&pw, file); err != nil {
+			file.Close()
+			return err
+		}
+		if closeErr := file.Close(); closeErr != nil {
+			return closeErr
+		}
+
+		return nil
+	})
+	if err != nil {
+		return stats, err
+	}
+
+	callProgress()
+	return stats, err
+}
+
+// ExtractGzip extracts a tar.gz archive to the destination directory
+func ExtractGzip(gzipPath, destDir string) error {
+	_, err := ExtractGzipWithProgress(gzipPath, destDir, nil)
+	return err
+}
+
+// ExtractGzipWithProgress extracts a tar.gz archive and reports progress via callback
+func ExtractGzipWithProgress(gzipPath, destDir string, progress ProgressFunc) (stats ExtractStats, err error) {
+	gzipFile, err := os.Open(gzipPath)
+	if err != nil {
+		return stats, err
+	}
+	defer gzipFile.Close()
+
+	// First pass: calculate total size
+	gzReader, err := gzip.NewReader(gzipFile)
+	if err != nil {
+		return stats, err
+	}
+	defer gzReader.Close()
+
+	tarReader := tar.NewReader(gzReader)
+	totalBytes := int64(0)
+	fileCount := 0
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return stats, err
+		}
+		if header.Typeflag == tar.TypeReg {
+			totalBytes += header.Size
+			fileCount++
+		}
+	}
+
+	stats.TotalBytes = totalBytes
+	stats.FileCount = fileCount
+
+	// Reopen for actual extraction
+	gzipFile.Seek(0, 0)
+	gzReader2, err := gzip.NewReader(gzipFile)
+	if err != nil {
+		return stats, err
+	}
+	defer gzReader2.Close()
+
+	tarReader2 := tar.NewReader(gzReader2)
+
+	done := int64(0)
+	callProgress := func() {
+		if progress != nil {
+			progress(done, totalBytes)
+		}
+	}
+	callProgress()
+
+	for {
+		header, err := tarReader2.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return stats, err
+		}
+
+		destPath := filepath.Join(destDir, filepath.FromSlash(header.Name))
+
+		// Security check: prevent path traversal
+		if !filepath.IsLocal(header.Name) {
+			return stats, fmt.Errorf("invalid file path: %s", header.Name)
+		}
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(destPath, os.FileMode(header.Mode)); err != nil {
+				return stats, err
+			}
+		case tar.TypeReg:
+			// Ensure parent directory exists
+			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				return stats, err
+			}
+
+			outFile, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.FileMode(header.Mode))
+			if err != nil {
+				return stats, err
+			}
+
+			pr := &progressReader{
+				r:        tarReader2,
+				done:     &done,
+				total:    totalBytes,
+				progress: progress,
+			}
+
+			if _, err = io.Copy(outFile, pr); err != nil {
+				outFile.Close()
+				return stats, err
+			}
+			if err := outFile.Close(); err != nil {
+				return stats, err
+			}
+		}
+	}
+
+	callProgress()
+	return stats, nil
 }
